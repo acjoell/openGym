@@ -40,7 +40,16 @@ let db = { users: [], creds: [], subs: [], invites: [] };
 try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
 db.subs = db.subs || [];
 db.invites = db.invites || [];
+db.trainer_clients = db.trainer_clients || [];
+db.packages = db.packages || [];
+db.attendances = db.attendances || [];
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
+const userRole = user => {
+  if (!user) return 'client';
+  if (isAdmin(user)) return 'trainer';
+  if (user.role === 'trainer' || user.role === 'client') return user.role;
+  return 'client';
+};
 function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
 function atomicWrite(file, content) {
   const tmp = file + '.tmp';
@@ -195,6 +204,24 @@ function requireAdmin(req, res) {
   if (!isAdmin(user)) { json(res, 403, { error: 'forbidden' }); return null; }
   return user;
 }
+// Guard for /api/trainer/* — resolves the caller and 401/403s if they aren't a trainer.
+function requireTrainer(req, res) {
+  const user = readSession(req);
+  if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
+  if (userRole(user) !== 'trainer') { json(res, 403, { error: 'forbidden: trainers only' }); return null; }
+  return user;
+}
+function syncPackageStatus(pkg) {
+  if (!pkg) return null;
+  if (pkg.status === 'active') {
+    if (pkg.remainingClasses <= 0) {
+      pkg.status = 'completed';
+    } else if (pkg.expiresAt && Date.now() > new Date(pkg.expiresAt).getTime()) {
+      pkg.status = 'expired';
+    }
+  }
+  return pkg;
+}
 function sessionCookie(user) {
   return `gymsid=${makeSession(user)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
 }
@@ -261,7 +288,7 @@ const routes = {
   'GET /api/me': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } });
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), role: userRole(user) } });
   },
 
   'POST /api/register/options': async (req, res) => {
@@ -316,7 +343,7 @@ const routes = {
       transports: body.credential?.response?.transports || []
     });
     saveDb();
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), role: userRole(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
   'POST /api/login/options': async (req, res) => {
@@ -355,7 +382,7 @@ const routes = {
     const user = db.users.find(u => u.id === cred.userId);
     if (!user) return json(res, 500, { error: 'user missing' });
     if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), role: userRole(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
   'POST /api/logout': async (req, res) => json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie }),
@@ -538,6 +565,394 @@ const routes = {
     db.invites = db.invites.filter(i => i.code !== inv.code);
     saveDb();
     json(res, 200, { ok: true });
+  },
+
+  /* ---------- trainer dashboard & client management ---------- */
+  'GET /api/trainer/clients': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const relations = (db.trainer_clients || []).filter(r => r.trainerId === trainer.id);
+    const clients = relations.map(r => {
+      const u = db.users.find(x => x.id === r.clientId);
+      return {
+        relationId: r.id,
+        clientId: r.clientId,
+        name: u ? u.name : 'Unknown',
+        assignedAt: r.assignedAt,
+        status: r.status,
+        userDisabled: !!(u && u.disabled)
+      };
+    });
+    json(res, 200, { clients });
+  },
+
+  'POST /api/trainer/clients/assign': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const body = await readBody(req);
+    const clientId = String(body.clientId || '').trim();
+    if (!clientId) return json(res, 400, { error: 'clientId is required' });
+    if (clientId === trainer.id) return json(res, 400, { error: 'cannot assign yourself' });
+
+    const client = db.users.find(u => u.id === clientId);
+    if (!client) return json(res, 404, { error: 'client not found' });
+    if (userRole(client) === 'trainer') return json(res, 400, { error: 'cannot assign a trainer as a client' });
+
+    // Check if client is already active with another trainer
+    const activeWithOther = (db.trainer_clients || []).find(r => r.clientId === clientId && r.status === 'active' && r.trainerId !== trainer.id);
+    if (activeWithOther) return json(res, 409, { error: 'client is currently active with another trainer' });
+
+    // Check existing relation with THIS trainer
+    const existing = (db.trainer_clients || []).find(r => r.clientId === clientId && r.trainerId === trainer.id);
+    if (existing) {
+      if (existing.status === 'active') {
+        return json(res, 409, { error: 'client is already active with you', relationId: existing.id });
+      }
+      // Reactivate archived or paused relation
+      existing.status = 'active';
+      existing.assignedAt = new Date().toISOString();
+      saveDb();
+      return json(res, 200, { ok: true, relation: existing });
+    }
+
+    // Create new relation
+    const relation = {
+      id: crypto.randomBytes(12).toString('base64url'),
+      trainerId: trainer.id,
+      clientId,
+      assignedAt: new Date().toISOString(),
+      status: 'active'
+    };
+    db.trainer_clients = db.trainer_clients || [];
+    db.trainer_clients.push(relation);
+    saveDb();
+    json(res, 200, { ok: true, relation });
+  },
+
+  'POST /api/trainer/clients/status': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const body = await readBody(req);
+    const validStatuses = ['active', 'paused', 'archived'];
+    const status = String(body.status || '').trim().toLowerCase();
+    if (!validStatuses.includes(status)) {
+      return json(res, 400, { error: 'valid status required: active, paused, archived' });
+    }
+
+    const relationId = String(body.relationId || '').trim();
+    const clientId = String(body.clientId || '').trim();
+
+    let rel = null;
+    if (relationId) {
+      rel = (db.trainer_clients || []).find(r => r.id === relationId);
+    } else if (clientId) {
+      // Find active or paused relation for this client and trainer
+      rel = (db.trainer_clients || []).find(r => r.clientId === clientId && r.trainerId === trainer.id && r.status !== 'archived');
+      if (!rel) {
+        rel = (db.trainer_clients || []).find(r => r.clientId === clientId && r.trainerId === trainer.id);
+      }
+    } else {
+      return json(res, 400, { error: 'relationId or clientId is required' });
+    }
+
+    if (!rel) return json(res, 404, { error: 'relation not found' });
+    if (rel.trainerId !== trainer.id && !isAdmin(trainer)) {
+      return json(res, 403, { error: 'forbidden: not your client' });
+    }
+
+    rel.status = status;
+    saveDb();
+    json(res, 200, { ok: true, relationId: rel.id, status: rel.status });
+  },
+
+  /* ---------- trainer package & membership management ---------- */
+  'GET /api/trainer/packages': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const clientId = new URL(req.url, 'http://x').searchParams.get('clientId');
+    if (!clientId) return json(res, 400, { error: 'clientId query parameter is required' });
+
+    // Validate relationship
+    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
+    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+
+    let dirty = false;
+    const pkgs = (db.packages || []).filter(p => p.clientId === clientId);
+    pkgs.forEach(p => {
+      const prev = p.status;
+      syncPackageStatus(p);
+      if (p.status !== prev) dirty = true;
+    });
+    if (dirty) saveDb();
+
+    const activePackage = pkgs.find(p => p.status === 'active') || null;
+    json(res, 200, { packages: pkgs.slice().reverse(), activePackage });
+  },
+
+  'POST /api/trainer/packages/create': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const body = await readBody(req);
+    const clientId = String(body.clientId || '').trim();
+    const name = String(body.name || '').trim().slice(0, 60);
+    const totalClasses = Math.round(+body.totalClasses || 0);
+    const expiresAt = body.expiresAt ? new Date(body.expiresAt).toISOString() : null;
+    const forceReplace = !!body.forceReplace;
+
+    if (!clientId) return json(res, 400, { error: 'clientId is required' });
+    if (!name) return json(res, 400, { error: 'name is required' });
+    if (totalClasses <= 0 || totalClasses > 1000) return json(res, 400, { error: 'totalClasses must be between 1 and 1000' });
+    if (!expiresAt || isNaN(new Date(expiresAt).getTime())) return json(res, 400, { error: 'valid expiresAt date is required' });
+    if (new Date(expiresAt).getTime() <= Date.now()) return json(res, 400, { error: 'expiresAt must be in the future' });
+
+    // Validate relationship
+    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
+    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+
+    db.packages = db.packages || [];
+    let dirty = false;
+    // Check existing active packages
+    const clientPkgs = db.packages.filter(p => p.clientId === clientId);
+    clientPkgs.forEach(p => {
+      const prev = p.status;
+      syncPackageStatus(p);
+      if (p.status !== prev) dirty = true;
+    });
+
+    const currentActive = clientPkgs.find(p => p.status === 'active');
+    if (currentActive) {
+      if (!forceReplace) {
+        if (dirty) saveDb();
+        return json(res, 409, {
+          error: 'client already has an active package',
+          activePackage: currentActive
+        });
+      }
+      currentActive.status = 'cancelled';
+      dirty = true;
+    }
+
+    const pkg = {
+      id: crypto.randomBytes(12).toString('base64url'),
+      clientId,
+      trainerId: trainer.id,
+      name,
+      totalClasses,
+      remainingClasses: totalClasses,
+      expiresAt,
+      createdAt: new Date().toISOString(),
+      status: 'active'
+    };
+
+    db.packages.push(pkg);
+    saveDb();
+    json(res, 200, { ok: true, package: pkg });
+  },
+
+  'POST /api/trainer/packages/cancel': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const body = await readBody(req);
+    const packageId = String(body.packageId || '').trim();
+    if (!packageId) return json(res, 400, { error: 'packageId is required' });
+
+    db.packages = db.packages || [];
+    const pkg = db.packages.find(p => p.id === packageId);
+    if (!pkg) return json(res, 404, { error: 'package not found' });
+
+    // Check ownership
+    if (pkg.trainerId !== trainer.id && !isAdmin(trainer)) {
+      return json(res, 403, { error: 'forbidden: not your client package' });
+    }
+
+    syncPackageStatus(pkg);
+    if (pkg.status !== 'active') {
+      return json(res, 400, { error: `cannot cancel package with status: ${pkg.status}` });
+    }
+
+    pkg.status = 'cancelled';
+    if (body.reason) pkg.cancelReason = String(body.reason).trim().slice(0, 100);
+    saveDb();
+    json(res, 200, { ok: true, packageId: pkg.id, status: pkg.status });
+  },
+
+  /* ---------- trainer attendance management ---------- */
+  'GET /api/trainer/attendance': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const clientId = new URL(req.url, 'http://x').searchParams.get('clientId');
+    if (!clientId) return json(res, 400, { error: 'clientId query parameter is required' });
+
+    // Validate relationship
+    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
+    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+
+    const list = (db.attendances || []).filter(a => a.clientId === clientId);
+    json(res, 200, { attendances: list.slice().reverse(), totalCount: list.length });
+  },
+
+  'POST /api/trainer/attendance/checkin': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const body = await readBody(req);
+    const clientId = String(body.clientId || '').trim();
+    if (!clientId) return json(res, 400, { error: 'clientId is required' });
+
+    const client = db.users.find(u => u.id === clientId);
+    if (!client) return json(res, 404, { error: 'client not found' });
+
+    // Validate relationship
+    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
+    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+
+    const workoutId = body.workoutId ? String(body.workoutId).trim() : null;
+    const note = body.note ? String(body.note).trim().slice(0, 200) : null;
+    const attDate = body.date && /^\d{4}-\d{2}-\d{2}$/.test(body.date) ? body.date : new Date().toISOString().slice(0, 10);
+
+    db.attendances = db.attendances || [];
+    db.packages = db.packages || [];
+
+    // Idempotency check 1: workoutId
+    if (workoutId) {
+      const existing = db.attendances.find(a => a.clientId === clientId && a.workoutId === workoutId);
+      if (existing) {
+        const pkg = db.packages.find(p => p.id === existing.packageId) || null;
+        return json(res, 200, {
+          ok: true,
+          attendance: existing,
+          remainingClasses: pkg ? pkg.remainingClasses : null,
+          packageStatus: pkg ? pkg.status : null,
+          alreadyProcessed: true
+        });
+      }
+    }
+
+    // Idempotency check 2: manual check-in within last 60 seconds for same client, trainer and date
+    if (!workoutId) {
+      const recent = db.attendances.find(a =>
+        a.clientId === clientId &&
+        a.trainerId === trainer.id &&
+        a.date === attDate &&
+        !a.workoutId &&
+        (Date.now() - new Date(a.createdAt).getTime()) < 60000
+      );
+      if (recent) {
+        const pkg = db.packages.find(p => p.id === recent.packageId) || null;
+        return json(res, 200, {
+          ok: true,
+          attendance: recent,
+          remainingClasses: pkg ? pkg.remainingClasses : null,
+          packageStatus: pkg ? pkg.status : null,
+          alreadyProcessed: true
+        });
+      }
+    }
+
+    // Find and sync active package for this client
+    let dirty = false;
+    const clientPkgs = db.packages.filter(p => p.clientId === clientId);
+    clientPkgs.forEach(p => {
+      const prev = p.status;
+      syncPackageStatus(p);
+      if (p.status !== prev) dirty = true;
+    });
+
+    const activePkg = clientPkgs.find(p => p.status === 'active' && p.remainingClasses > 0);
+    if (!activePkg) {
+      if (dirty) saveDb();
+      return json(res, 400, { error: 'no active package with available classes' });
+    }
+
+    // Atomic mutation: deduct 1 class and record attendance
+    activePkg.remainingClasses -= 1;
+    if (activePkg.remainingClasses === 0) {
+      activePkg.status = 'completed';
+    }
+
+    const attendance = {
+      id: crypto.randomBytes(12).toString('base64url'),
+      packageId: activePkg.id,
+      clientId,
+      trainerId: trainer.id,
+      date: attDate,
+      workoutId,
+      note,
+      createdAt: new Date().toISOString()
+    };
+
+    db.attendances.push(attendance);
+    saveDb();
+
+    json(res, 200, {
+      ok: true,
+      attendance,
+      remainingClasses: activePkg.remainingClasses,
+      packageStatus: activePkg.status,
+      alreadyProcessed: false
+    });
+  },
+
+  /* ---------- trainer routine & plan management ---------- */
+  'GET /api/trainer/client/plan': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const clientId = new URL(req.url, 'http://x').searchParams.get('clientId');
+    if (!clientId) return json(res, 400, { error: 'clientId query parameter is required' });
+
+    // Validate relationship
+    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
+    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+
+    const client = db.users.find(u => u.id === clientId);
+    if (!client) return json(res, 404, { error: 'client not found' });
+
+    const S = readState(clientId) || {};
+    json(res, 200, {
+      clientId,
+      routines: S.routines || [],
+      week: S.week || {},
+      dayPlan: S.dayPlan || {},
+      lastSync: S._ts || null
+    });
+  },
+
+  'PUT /api/trainer/client/plan': async (req, res) => {
+    const trainer = requireTrainer(req, res);
+    if (!trainer) return;
+    const body = await readBody(req);
+    const clientId = String(body.clientId || '').trim();
+    if (!clientId) return json(res, 400, { error: 'clientId is required' });
+
+    const client = db.users.find(u => u.id === clientId);
+    if (!client) return json(res, 404, { error: 'client not found' });
+
+    // Validate relationship
+    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
+    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+
+    if (body.routines !== undefined && !Array.isArray(body.routines)) {
+      return json(res, 400, { error: 'routines must be an array' });
+    }
+
+    // Read current state or create empty container
+    const S = readState(clientId) || {};
+
+    // Strictly modify ONLY plan fields
+    if (body.routines !== undefined) S.routines = body.routines;
+    if (body.week !== undefined && typeof body.week === 'object' && body.week !== null) S.week = body.week;
+    if (body.dayPlan !== undefined && typeof body.dayPlan === 'object' && body.dayPlan !== null) S.dayPlan = body.dayPlan;
+
+    // Stamp new timestamp so client's pullState picks up changes
+    S._ts = Date.now();
+
+    // Workouts, bodyweight, active and user preferences remain completely untouched
+    atomicWrite(stateFile(clientId), JSON.stringify(S));
+
+    json(res, 200, {
+      ok: true,
+      clientId,
+      updatedAt: S._ts
+    });
   }
 };
 
