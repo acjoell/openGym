@@ -1,969 +1,822 @@
-/* opengym-api — passkey (WebAuthn) auth + per-user state storage for openGym
-   No framework, JSON-file storage, signed session cookies.               */
+/* opengym-api — Personal Training Platform Backend
+   Prisma + SQLite, Password Auth with bcrypt, Session Cookies, RBAC */
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  generateRegistrationOptions, verifyRegistrationResponse,
-  generateAuthenticationOptions, verifyAuthenticationResponse
-} from '@simplewebauthn/server';
-import webpush from 'web-push';
+import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
 
 const PORT = +(process.env.PORT || 3000);
-const DATA = process.env.DATA_DIR || '/data';
-const RP_ID = process.env.RP_ID || 'localhost';
+const DATA = process.env.DATA_DIR || path.resolve(process.cwd(), '../data');
 const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
-const RP_NAME = process.env.RP_NAME || 'openGym';
-// Admin dashboard (issue): admins are matched by uid; INVITE_ONLY gates new signups behind a
-// code the admin generates. Both default off so a fresh self-hosted instance stays open.
-const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const INVITE_ONLY = /^(1|true|yes|on)$/i.test(process.env.INVITE_ONLY || '');
-// 90 days keeps someone who trains a few times a week permanently signed in without a stolen
-// cookie staying good for a year. Overridable because a family instance and one on the open
-// internet don't want the same number. Only affects cookies minted from now on — the expiry is
-// baked into each cookie when it's issued, so lowering this never cuts an existing session short.
 const SESSION_DAYS = Math.max(1, +(process.env.SESSION_DAYS || 90) || 90);
 const MAX_BODY = 5 * 1024 * 1024;
-// Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
 
 fs.mkdirSync(DATA, { recursive: true });
 
-/* ---------- secret + db ---------- */
+/* ---------- Secret & Prisma ---------- */
 const secretFile = path.join(DATA, 'secret');
 if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
 const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
 
-const dbFile = path.join(DATA, 'db.json');
-let db = { users: [], creds: [], subs: [], invites: [] };
-try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
-db.subs = db.subs || [];
-db.invites = db.invites || [];
-db.trainer_clients = db.trainer_clients || [];
-db.packages = db.packages || [];
-db.attendances = db.attendances || [];
-const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
-const userRole = user => {
-  if (!user) return 'client';
-  if (isAdmin(user)) return 'trainer';
-  if (user.role === 'trainer' || user.role === 'client') return user.role;
-  return 'client';
-};
-function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
-function atomicWrite(file, content) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, content);
-  fs.renameSync(tmp, file);
-}
-const stateFile = uid => path.join(DATA, 'state-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
-function readState(uid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
-}
-
-/* ---------- push notifications (Web Push / VAPID) ---------- */
-const vapidFile = path.join(DATA, 'vapid.json');
-let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
-webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
-
-async function sendPush(userId, payload) {
-  const subs = db.subs.filter(s => s.userId === userId);
-  if (!subs.length) return;
-  const body = JSON.stringify(payload);
-  let dirty = false;
-  await Promise.all(subs.map(async sub => {
-    // urgency 'high' is the one lever we have over delivery speed — iOS/Android throttle
-    // low-urgency background push more aggressively under battery-saving modes. TTL is left
-    // at the library default (long) so a briefly-offline device still gets it once reconnected,
-    // rather than risking it being dropped for the sake of shaving off latency that TTL doesn't
-    // actually control anyway.
-    try { await webpush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, body, { urgency: 'high' }); }
-    catch (e) {
-      console.error('push send failed', userId, e.statusCode, e.body || e.message);
-      if (e.statusCode === 404 || e.statusCode === 410) {
-        db.subs = db.subs.filter(s => s.endpoint !== sub.endpoint); dirty = true;
-      }
-    }
-  }));
-  if (dirty) saveDb();
-}
-
-// Rest-timer alerts: client schedules on start/extend, cancels on skip or on-screen completion —
-// this only fires when the tab was backgrounded/suspended and never got to cancel it itself.
-const restTimers = new Map(); // userId -> Timeout
-function scheduleRestTimer(userId, sec) {
-  const t = restTimers.get(userId);
-  if (t) clearTimeout(t);
-  restTimers.set(userId, setTimeout(() => {
-    restTimers.delete(userId);
-    sendPush(userId, { title: 'Rest over 💪', body: 'Time for your next set.', tag: 'rest-timer' });
-  }, sec * 1000));
-}
-function cancelRestTimer(userId) {
-  const t = restTimers.get(userId);
-  if (t) { clearTimeout(t); restTimers.delete(userId); }
-}
-
-// "Workout planned today" reminder — one per user per day, at their chosen time.
-// Duplicated (not imported) from frontend/src/lib/history.js effectiveRoutineId — tiny pure helper, not worth sharing across the two runtimes.
-function effectiveRoutineId(S, iso) {
-  const ov = S.dayPlan?.[iso];
-  if (ov === 'rest') return null;
-  if (ov && S.routines?.some(r => r.id === ov)) return ov;
-  const wd = new Date(iso + 'T12:00:00').getDay();
-  return S.week?.[wd] || null;
-}
-// Computes "now" in an arbitrary IANA zone (e.g. "Europe/Lisbon") instead of the server's own —
-// each user's reminder fires by their own clock, wherever they and their phone actually are.
-function userNow(tz) {
-  try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz, hour12: false,
-      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
-    }).formatToParts(new Date());
-    const g = t => parts.find(p => p.type === t)?.value;
-    return { date: `${g('year')}-${g('month')}-${g('day')}`, hhmm: `${g('hour')}:${g('minute')}` };
-  } catch { return null; } // unknown/invalid tz string — skip this user rather than guess
-}
-setInterval(() => {
-  for (const user of db.users) {
-    if (!db.subs.some(s => s.userId === user.id)) continue;
-    const S = readState(user.id);
-    if (!S?.reminder?.on) continue;
-    const now = userNow(S.reminder.tz || 'UTC');
-    if (!now || S.reminder.time !== now.hhmm) continue;
-    if (user.lastReminder === now.date) continue;
-    if ((S.workouts || []).some(w => w.d === now.date)) continue;
-    const rid = effectiveRoutineId(S, now.date);
-    if (!rid) continue; // rest day — nothing planned
-    const routine = (S.routines || []).find(r => r.id === rid);
-    console.log('reminder firing', user.id, rid);
-    user.lastReminder = now.date;
-    saveDb();
-    sendPush(user.id, {
-      title: routine ? `${routine.emoji || '🏋️'} ${routine.name} today` : 'Workout planned today',
-      body: "It's on your plan — let's go 💪",
-      tag: 'day-reminder'
-    });
-  }
-// Checked every 10s (not 60s) — ticks aren't aligned to the top of the minute, so a 60s
-// interval could sit on your target minute for up to 59s before noticing. 10s caps that at ~9s.
-}, 10000).unref();
-
-/* ---------- sessions (signed cookie) ---------- */
-function sign(payload) {
-  const mac = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
-  return payload + '.' + mac;
-}
-function verifySig(token) {
-  const i = token.lastIndexOf('.');
-  if (i < 0) return null;
-  const payload = token.slice(0, i), mac = token.slice(i + 1);
-  const expect = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
-  try {
-    if (!crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(expect))) return null;
-  } catch { return null; }
-  return payload;
-}
-// Session payload is `<uid>:<expiry>:<version>`, where the version is the user's `sv` counter.
-// Bumping `sv` (POST /api/logout/all) makes every cookie ever handed out for that account stop
-// verifying, which is the only revocation there was before short of deleting ./data/secret and
-// signing out the whole instance. Cookies minted before `sv` existed have no third field and are
-// read as version 0, matching a user who has never bumped — they stay valid until they expire.
-const sessionVersion = user => user.sv || 0;
-function makeSession(user) {
-  const exp = Date.now() + SESSION_DAYS * 86400000;
-  return sign(user.id + ':' + exp + ':' + sessionVersion(user));
-}
-function readSession(req) {
-  const cookies = Object.fromEntries((req.headers.cookie || '').split(';').map(c => {
-    const i = c.indexOf('='); return i < 0 ? ['', ''] : [c.slice(0, i).trim(), c.slice(i + 1).trim()];
-  }));
-  const tok = cookies.gymsid;
-  if (!tok) return null;
-  const payload = verifySig(tok);
-  if (!payload) return null;
-  const [uid, exp, ver] = payload.split(':');
-  if (!uid || +exp < Date.now()) return null;
-  const user = db.users.find(u => u.id === uid) || null;
-  if (!user) return null;
-  if (user.disabled) return null;           // disabled accounts are locked out everywhere
-  // Missing third field = pre-versioning cookie = version 0. Anything non-numeric is a malformed
-  // payload (it still had to pass the HMAC, so this is belt-and-braces) and is refused outright.
-  const claimed = ver === undefined ? 0 : Number(ver);
-  if (!Number.isInteger(claimed) || claimed !== sessionVersion(user)) return null;
-  return user;
-}
-// Guard for /api/admin/* — resolves the caller and 401/403s if they aren't an admin.
-function requireAdmin(req, res) {
-  const user = readSession(req);
-  if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
-  if (!isAdmin(user)) { json(res, 403, { error: 'forbidden' }); return null; }
-  return user;
-}
-// Guard for /api/trainer/* — resolves the caller and 401/403s if they aren't a trainer.
-function requireTrainer(req, res) {
-  const user = readSession(req);
-  if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
-  if (userRole(user) !== 'trainer') { json(res, 403, { error: 'forbidden: trainers only' }); return null; }
-  return user;
-}
-function syncPackageStatus(pkg) {
-  if (!pkg) return null;
-  if (pkg.status === 'active') {
-    if (pkg.remainingClasses <= 0) {
-      pkg.status = 'completed';
-    } else if (pkg.expiresAt && Date.now() > new Date(pkg.expiresAt).getTime()) {
-      pkg.status = 'expired';
+const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.DATABASE_URL || `file:${path.join(DATA, 'gym.db').replace(/\\/g, '/')}`
     }
   }
-  return pkg;
-}
-function sessionCookie(user) {
-  return `gymsid=${makeSession(user)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
-}
-const clearCookie = `gymsid=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
+});
 
-/* ---------- challenge store (in-memory, 5 min TTL) ---------- */
-const challenges = new Map(); // cid -> {challenge, name?, uid?, exp}
-function putChallenge(data) {
-  const cid = crypto.randomBytes(16).toString('base64url');
-  challenges.set(cid, { ...data, exp: Date.now() + 5 * 60000 });
-  return cid;
+/* ---------- Session Cookies & Crypto ---------- */
+function signSession(uid) {
+  const exp = Date.now() + SESSION_DAYS * 86400 * 1000;
+  const payload = `${uid}.${exp}`;
+  const hmac = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
+  return `${payload}.${hmac}`;
 }
-function takeChallenge(cid) {
-  const c = challenges.get(cid);
-  challenges.delete(cid);
-  if (!c || c.exp < Date.now()) return null;
-  return c;
-}
-setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) challenges.delete(k); }, 60000).unref();
 
-/* ---------- helpers ---------- */
-function json(res, code, obj, extraHeaders) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(extraHeaders || {}) });
-  res.end(body);
+function verifySession(cookieStr) {
+  if (!cookieStr) return null;
+  const match = cookieStr.match(/(?:^|;\s*)gym_session=([a-zA-Z0-9_.-]+)/);
+  if (!match) return null;
+  const val = match[1];
+  const parts = val.split('.');
+  if (parts.length !== 3) return null;
+  const [uid, expStr, sig] = parts;
+  const exp = parseInt(expStr, 10);
+  if (isNaN(exp) || exp < Date.now()) return null;
+  const payload = `${uid}.${expStr}`;
+  const expectedSig = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
+  if (crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) {
+    return uid;
+  }
+  return null;
 }
-function readBody(req) {
+
+function parseCookies(req) {
+  const list = {};
+  const rc = req.headers.cookie;
+  rc && rc.split(';').forEach(cookie => {
+    const parts = cookie.split('=');
+    list[parts.shift().trim()] = decodeURI(parts.join('='));
+  });
+  return list;
+}
+
+/* ---------- Request Helpers ---------- */
+async function readBody(req) {
   return new Promise((resolve, reject) => {
-    let size = 0; const chunks = [];
-    req.on('data', d => {
-      size += d.length;
-      if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return; }
-      chunks.push(d);
+    let body = '';
+    let size = 0;
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > MAX_BODY) { reject(new Error('Body too large')); return; }
+      body += chunk;
     });
     req.on('end', () => {
-      try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); }
-      catch { reject(new Error('bad json')); }
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(new Error('Invalid JSON'));
+      }
     });
     req.on('error', reject);
   });
 }
-const b64uToBuf = s => Buffer.from(s, 'base64url');
 
-/* ---------- live presence (in-memory) ---------- */
-// Clients heartbeat /api/activity while a workout is on screen; the admin dashboard reads who's
-// live. Purely ephemeral — never persisted. Expires shortly after the last ping.
-const presence = new Map();               // uid -> { name, exIdx, exTotal, setsDone, setsTotal, startedAt, updatedAt }
-const PRESENCE_TTL = 70000;               // ~3.5× the 20s client heartbeat
-function livePresence(uid) {
-  const p = presence.get(uid);
-  if (!p) return null;
-  if (Date.now() - p.updatedAt > PRESENCE_TTL) { presence.delete(uid); return null; }
-  return p;
+function sendJson(res, status, data, headers = {}) {
+  const json = JSON.stringify(data);
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(json),
+    ...headers
+  });
+  res.end(json);
 }
-setInterval(() => { for (const [k, v] of presence) if (Date.now() - v.updatedAt > PRESENCE_TTL) presence.delete(k); }, 30000).unref();
 
-/* ---------- routes ---------- */
-const routes = {
-  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: db.users.length }),
+function sendError(res, status, message) {
+  sendJson(res, status, { error: message });
+}
 
-  // Public config the login screen needs before anyone is signed in.
-  'GET /api/config': async (req, res) => json(res, 200, { invite_only: INVITE_ONLY }),
+/* ---------- Auth Middleware ---------- */
+async function authenticate(req) {
+  const uid = verifySession(req.headers.cookie);
+  if (!uid) return null;
+  return await prisma.user.findUnique({ where: { id: uid } });
+}
 
-  'GET /api/me': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), role: userRole(user) } });
-  },
+/* ---------- HTTP Server Routing ---------- */
+const server = http.createServer(async (req, res) => {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', ORIGIN);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  'POST /api/register/options': async (req, res) => {
-    const body = await readBody(req);
-    const name = String(body.name || '').trim().slice(0, 40);
-    if (!name) return json(res, 400, { error: 'name required' });
-    const code = String(body.code || '').trim().toUpperCase();
-    if (INVITE_ONLY && !db.invites.some(i => i.code === code && !i.usedBy && !i.revoked))
-      return json(res, 403, { error: 'a valid invite code is required' });
-    const uid = crypto.randomBytes(12).toString('base64url');
-    const options = await generateRegistrationOptions({
-      rpName: RP_NAME, rpID: RP_ID,
-      userID: Buffer.from(uid), userName: name, userDisplayName: name,
-      attestationType: 'none',
-      authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
-      excludeCredentials: []
-    });
-    const cid = putChallenge({ challenge: options.challenge, name, uid, code });
-    json(res, 200, { cid, options });
-  },
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
-  'POST /api/register/verify': async (req, res) => {
-    const body = await readBody(req);
-    const c = takeChallenge(body.cid);
-    if (!c || !c.uid) return json(res, 400, { error: 'challenge expired — try again' });
-    let verification;
-    try {
-      verification = await verifyRegistrationResponse({
-        response: body.credential,
-        expectedChallenge: c.challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
-        requireUserVerification: false
-      });
-    } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
-    if (!verification.verified) return json(res, 400, { error: 'not verified' });
-    const { credential } = verification.registrationInfo;
-    if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
-    // Re-check the invite at the last moment (it may have been used/revoked since options), then burn it.
-    let invite = null;
-    if (INVITE_ONLY) {
-      invite = db.invites.find(i => i.code === c.code && !i.usedBy && !i.revoked);
-      if (!invite) return json(res, 403, { error: 'invite code is no longer valid — ask for a new one' });
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+
+  try {
+    /* ==========================================================================
+       1. AUTHENTICATION & SESSION ENDPOINTS
+       ========================================================================== */
+
+    // GET /api/config
+    if (req.method === 'GET' && pathname === '/api/config') {
+      sendJson(res, 200, { invite_only: false });
+      return;
     }
-    const user = { id: c.uid, name: c.name, created: new Date().toISOString() };
-    if (invite) { user.invitedBy = invite.code; invite.usedBy = user.id; invite.usedAt = user.created; }
-    db.users.push(user);
-    db.creds.push({
-      id: credential.id, userId: user.id,
-      publicKey: Buffer.from(credential.publicKey).toString('base64url'),
-      counter: credential.counter || 0,
-      transports: body.credential?.response?.transports || []
-    });
-    saveDb();
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), role: userRole(user) } }, { 'Set-Cookie': sessionCookie(user) });
-  },
 
-  'POST /api/login/options': async (req, res) => {
-    const options = await generateAuthenticationOptions({
-      rpID: RP_ID, userVerification: 'preferred', allowCredentials: []
-    });
-    const cid = putChallenge({ challenge: options.challenge });
-    json(res, 200, { cid, options });
-  },
+    // POST /api/auth/login or POST /api/login
+    if (req.method === 'POST' && (pathname === '/api/auth/login' || pathname === '/api/login')) {
+      const body = await readBody(req);
+      const identifier = (body.username || body.identifier || body.email || '').trim().toLowerCase();
+      const password = body.password || '';
+      const expectedRole = body.expectedRole || null;
 
-  'POST /api/login/verify': async (req, res) => {
-    const body = await readBody(req);
-    const c = takeChallenge(body.cid);
-    if (!c) return json(res, 400, { error: 'challenge expired — try again' });
-    const cred = db.creds.find(x => x.id === body.credential?.id);
-    if (!cred) return json(res, 404, { error: 'unknown passkey — create a profile first' });
-    let verification;
-    try {
-      verification = await verifyAuthenticationResponse({
-        response: body.credential,
-        expectedChallenge: c.challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
-        requireUserVerification: false,
-        credential: {
-          id: cred.id,
-          publicKey: b64uToBuf(cred.publicKey),
-          counter: cred.counter,
-          transports: cred.transports
+      if (!identifier || !password) {
+        sendError(res, 400, 'Usuario y contraseña son requeridos');
+        return;
+      }
+
+      // Buscar usuario por username o email
+      const user = await prisma.user.findFirst({
+        where: {
+          OR: [
+            { username: identifier },
+            { email: identifier }
+          ]
         }
       });
-    } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
-    if (!verification.verified) return json(res, 400, { error: 'not verified' });
-    cred.counter = verification.authenticationInfo.newCounter;
-    saveDb();
-    const user = db.users.find(u => u.id === cred.userId);
-    if (!user) return json(res, 500, { error: 'user missing' });
-    if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), role: userRole(user) } }, { 'Set-Cookie': sessionCookie(user) });
-  },
 
-  'POST /api/logout': async (req, res) => json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie }),
+      if (!user || !user.passwordHash) {
+        sendError(res, 401, 'Credenciales incorrectas');
+        return;
+      }
 
-  // "Sign out everywhere" — bumps this user's session version, which invalidates every cookie
-  // ever issued for the account, on every device, including a copy someone else walked off with.
-  // The caller's own cookie is cleared here too, so the browser doing it doesn't sit on a token
-  // it no longer accepts. Passkeys are untouched: signing back in works immediately.
-  'POST /api/logout/all': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    user.sv = sessionVersion(user) + 1;
-    saveDb();
-    json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
-  },
+      const match = bcrypt.compareSync(password, user.passwordHash);
+      if (!match) {
+        sendError(res, 401, 'Credenciales incorrectas');
+        return;
+      }
 
-  'GET /api/data': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    try {
-      const state = JSON.parse(fs.readFileSync(stateFile(user.id), 'utf8'));
-      json(res, 200, { state });
-    } catch { json(res, 200, { state: null }); }
-  },
+      // Validar rol esperado
+      if (expectedRole && user.role !== expectedRole) {
+        sendError(res, 403, `Acceso no autorizado para el rol ${expectedRole}`);
+        return;
+      }
 
-  'PUT /api/data': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    const body = await readBody(req);
-    if (!body.state || typeof body.state !== 'object') return json(res, 400, { error: 'state required' });
-    delete body.state.active;              // in-progress workouts stay device-local
-    atomicWrite(stateFile(user.id), JSON.stringify(body.state));
-    json(res, 200, { ok: true, ts: body.state._ts || null });
-  },
+      // Validar estado de la cuenta
+      if (user.status === 'paused' || user.status === 'archived') {
+        sendError(res, 403, 'Tu cuenta está inactiva o pausada. Contacta a tu entrenador.');
+        return;
+      }
 
-  'GET /api/push/public-key': async (req, res) => json(res, 200, { key: vapid.publicKey }),
+      const sessionCookie = signSession(user.id);
+      const cookieHeader = `gym_session=${sessionCookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400};${SECURE}`;
 
-  'POST /api/push/subscribe': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    const body = await readBody(req);
-    const sub = body.subscription;
-    if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) return json(res, 400, { error: 'invalid subscription' });
-    db.subs = db.subs.filter(s => s.endpoint !== sub.endpoint);
-    db.subs.push({ userId: user.id, endpoint: sub.endpoint, keys: sub.keys, created: new Date().toISOString() });
-    saveDb();
-    json(res, 200, { ok: true });
-  },
+      sendJson(res, 200, {
+        user: {
+          id: user.id,
+          name: user.name,
+          username: user.username,
+          email: user.email,
+          role: user.role,
+          status: user.status
+        }
+      }, { 'Set-Cookie': cookieHeader });
+      return;
+    }
 
-  'POST /api/push/unsubscribe': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    const body = await readBody(req);
-    db.subs = db.subs.filter(s => !(s.userId === user.id && s.endpoint === body.endpoint));
-    saveDb();
-    json(res, 200, { ok: true });
-  },
+    // POST /api/auth/client-activate or POST /api/client/activate
+    if (req.method === 'POST' && (pathname === '/api/auth/client-activate' || pathname === '/api/client/activate')) {
+      const body = await readBody(req);
+      const code = (body.code || '').trim().toUpperCase();
+      const rawUsername = (body.username || '').trim().toLowerCase();
+      const password = body.password || '';
+      const email = (body.email || '').trim().toLowerCase() || null;
 
-  'POST /api/push/test': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    await sendPush(user.id, { title: 'openGym', body: 'Test notification ✅ — this is what alerts look like.', tag: 'test' });
-    json(res, 200, { ok: true });
-  },
+      if (!code || !password) {
+        sendError(res, 400, 'Código y contraseña son requeridos');
+        return;
+      }
+      if (password.length < 6) {
+        sendError(res, 400, 'La contraseña debe tener al menos 6 caracteres');
+        return;
+      }
 
-  'POST /api/push/rest-timer': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    const body = await readBody(req);
-    const sec = Math.max(1, Math.min(3600, Math.round(+body.seconds || 0)));
-    if (!sec) return json(res, 400, { error: 'seconds required' });
-    scheduleRestTimer(user.id, sec);
-    json(res, 200, { ok: true });
-  },
-
-  'POST /api/push/rest-timer/cancel': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    cancelRestTimer(user.id);
-    json(res, 200, { ok: true });
-  },
-
-  // Live-workout heartbeat: client pings while a workout is on screen; { active:false } drops it.
-  'POST /api/activity': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    const body = await readBody(req);
-    if (body.active) {
-      presence.set(user.id, {
-        name: String(body.name || '').slice(0, 60),
-        exIdx: +body.exIdx || 0, exTotal: +body.exTotal || 0,
-        setsDone: +body.setsDone || 0, setsTotal: +body.setsTotal || 0,
-        startedAt: +body.startedAt || Date.now(),
-        updatedAt: Date.now()
+      const act = await prisma.activationCode.findFirst({
+        where: { code, usedAt: null },
+        include: { client: true }
       });
-    } else presence.delete(user.id);
-    json(res, 200, { ok: true });
-  },
 
-  /* ---------- admin dashboard ---------- */
-  // One row per user, cheap enough for a personal instance (reads each state file once).
-  'GET /api/admin/users': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const users = db.users.map(u => {
-      const S = readState(u.id) || {};
-      const workouts = S.workouts || [];
-      const last = workouts[workouts.length - 1];
-      return {
-        id: u.id, name: u.name, created: u.created || null,
-        disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null,
-        workouts: workouts.length,
-        lastWorkout: last ? last.d : null,
-        lastSync: S._ts || null,
-        hasPush: db.subs.some(s => s.userId === u.id),
-        live: livePresence(u.id)
-      };
-    });
-    json(res, 200, { users, invite_only: INVITE_ONLY, now: Date.now() });
-  },
-
-  // Drill-down: full workout history + body-weight log for one user.
-  'GET /api/admin/user': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const id = new URL(req.url, 'http://x').searchParams.get('id');
-    const u = db.users.find(x => x.id === id);
-    if (!u) return json(res, 404, { error: 'no such user' });
-    const S = readState(u.id) || {};
-    json(res, 200, {
-      user: { id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null },
-      unit: S.unit || 'kg',
-      lastSync: S._ts || null,
-      routines: (S.routines || []).map(r => ({ id: r.id, name: r.name, emoji: r.emoji, count: (r.ex || []).length })),
-      bodyweight: S.bodyweight || [],
-      workouts: (S.workouts || []).slice().reverse()   // newest first for display
-    });
-  },
-
-  'POST /api/admin/user/disable': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const body = await readBody(req);
-    const u = db.users.find(x => x.id === body.id);
-    if (!u) return json(res, 404, { error: 'no such user' });
-    if (isAdmin(u)) return json(res, 400, { error: 'cannot disable an admin' });
-    u.disabled = !!body.disabled;
-    if (u.disabled) presence.delete(u.id);   // drop them off "training now" at once
-    saveDb();
-    json(res, 200, { ok: true, id: u.id, disabled: u.disabled });
-  },
-
-  'GET /api/admin/invites': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    // resolve usedBy uid → name for display
-    const invites = db.invites.map(i => ({
-      ...i, usedByName: i.usedBy ? (db.users.find(u => u.id === i.usedBy) || {}).name || null : null
-    }));
-    json(res, 200, { invites, invite_only: INVITE_ONLY });
-  },
-
-  'POST /api/admin/invites/new': async (req, res) => {
-    const admin = requireAdmin(req, res); if (!admin) return;
-    const body = await readBody(req);
-    let code;
-    // 16 hex chars = 64 bits, up from 8 chars / 32 bits. The app has no rate limiting by design
-    // (that's the reverse proxy's job) and /api/register/options tells a caller whether a code is
-    // good, so the code itself has to be the thing that isn't worth guessing. Codes already in
-    // db.json keep working — validation is an exact string compare, never a length or format check.
-    do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (db.invites.some(i => i.code === code));
-    const invite = { code, note: String(body.note || '').slice(0, 60), createdBy: admin.id, created: new Date().toISOString() };
-    db.invites.push(invite);
-    saveDb();
-    json(res, 200, { invite });
-  },
-
-  'POST /api/admin/invites/revoke': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const body = await readBody(req);
-    const inv = db.invites.find(i => i.code === String(body.code || '').toUpperCase());
-    if (!inv) return json(res, 404, { error: 'no such code' });
-    if (inv.usedBy) return json(res, 400, { error: 'already used — cannot revoke' });
-    db.invites = db.invites.filter(i => i.code !== inv.code);
-    saveDb();
-    json(res, 200, { ok: true });
-  },
-
-  /* ---------- trainer dashboard & client management ---------- */
-  'GET /api/trainer/clients': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const relations = (db.trainer_clients || []).filter(r => r.trainerId === trainer.id);
-    const clients = relations.map(r => {
-      const u = db.users.find(x => x.id === r.clientId);
-      return {
-        relationId: r.id,
-        clientId: r.clientId,
-        name: u ? u.name : 'Unknown',
-        assignedAt: r.assignedAt,
-        status: r.status,
-        userDisabled: !!(u && u.disabled)
-      };
-    });
-    json(res, 200, { clients });
-  },
-
-  'POST /api/trainer/clients/assign': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const body = await readBody(req);
-    const clientId = String(body.clientId || '').trim();
-    if (!clientId) return json(res, 400, { error: 'clientId is required' });
-    if (clientId === trainer.id) return json(res, 400, { error: 'cannot assign yourself' });
-
-    const client = db.users.find(u => u.id === clientId);
-    if (!client) return json(res, 404, { error: 'client not found' });
-    if (userRole(client) === 'trainer') return json(res, 400, { error: 'cannot assign a trainer as a client' });
-
-    // Check if client is already active with another trainer
-    const activeWithOther = (db.trainer_clients || []).find(r => r.clientId === clientId && r.status === 'active' && r.trainerId !== trainer.id);
-    if (activeWithOther) return json(res, 409, { error: 'client is currently active with another trainer' });
-
-    // Check existing relation with THIS trainer
-    const existing = (db.trainer_clients || []).find(r => r.clientId === clientId && r.trainerId === trainer.id);
-    if (existing) {
-      if (existing.status === 'active') {
-        return json(res, 409, { error: 'client is already active with you', relationId: existing.id });
+      if (!act || !act.client) {
+        sendError(res, 404, 'Código de activación inválido o ya utilizado');
+        return;
       }
-      // Reactivate archived or paused relation
-      existing.status = 'active';
-      existing.assignedAt = new Date().toISOString();
-      saveDb();
-      return json(res, 200, { ok: true, relation: existing });
-    }
 
-    // Create new relation
-    const relation = {
-      id: crypto.randomBytes(12).toString('base64url'),
-      trainerId: trainer.id,
-      clientId,
-      assignedAt: new Date().toISOString(),
-      status: 'active'
-    };
-    db.trainer_clients = db.trainer_clients || [];
-    db.trainer_clients.push(relation);
-    saveDb();
-    json(res, 200, { ok: true, relation });
-  },
+      const clientId = act.clientId;
+      const username = rawUsername || act.client.username || `client_${clientId.slice(0, 6)}`;
+      const passwordHash = bcrypt.hashSync(password, 10);
 
-  'POST /api/trainer/clients/status': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const body = await readBody(req);
-    const validStatuses = ['active', 'paused', 'archived'];
-    const status = String(body.status || '').trim().toLowerCase();
-    if (!validStatuses.includes(status)) {
-      return json(res, 400, { error: 'valid status required: active, paused, archived' });
-    }
-
-    const relationId = String(body.relationId || '').trim();
-    const clientId = String(body.clientId || '').trim();
-
-    let rel = null;
-    if (relationId) {
-      rel = (db.trainer_clients || []).find(r => r.id === relationId);
-    } else if (clientId) {
-      // Find active or paused relation for this client and trainer
-      rel = (db.trainer_clients || []).find(r => r.clientId === clientId && r.trainerId === trainer.id && r.status !== 'archived');
-      if (!rel) {
-        rel = (db.trainer_clients || []).find(r => r.clientId === clientId && r.trainerId === trainer.id);
+      // Verificar si el username ya está tomado por otro usuario
+      const existingUser = await prisma.user.findFirst({
+        where: { username, NOT: { id: clientId } }
+      });
+      if (existingUser) {
+        sendError(res, 400, 'El nombre de usuario ya está en uso. Elige otro.');
+        return;
       }
-    } else {
-      return json(res, 400, { error: 'relationId or clientId is required' });
+
+      // Actualizar cliente
+      const updatedUser = await prisma.user.update({
+        where: { id: clientId },
+        data: {
+          username,
+          email: email || act.client.email,
+          passwordHash,
+          status: 'active'
+        }
+      });
+
+      // Quemar el código
+      await prisma.activationCode.update({
+        where: { id: act.id },
+        data: { usedAt: new Date() }
+      });
+
+      const sessionCookie = signSession(updatedUser.id);
+      const cookieHeader = `gym_session=${sessionCookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400};${SECURE}`;
+
+      sendJson(res, 200, {
+        user: {
+          id: updatedUser.id,
+          name: updatedUser.name,
+          username: updatedUser.username,
+          email: updatedUser.email,
+          role: updatedUser.role,
+          status: updatedUser.status
+        }
+      }, { 'Set-Cookie': cookieHeader });
+      return;
     }
 
-    if (!rel) return json(res, 404, { error: 'relation not found' });
-    if (rel.trainerId !== trainer.id && !isAdmin(trainer)) {
-      return json(res, 403, { error: 'forbidden: not your client' });
+    // GET /api/me
+    if (req.method === 'GET' && pathname === '/api/me') {
+      const user = await authenticate(req);
+      if (!user) {
+        sendError(res, 401, 'No autenticado');
+        return;
+      }
+      sendJson(res, 200, {
+        user: {
+          id: user.id,
+          name: user.name,
+          username: user.username,
+          email: user.email,
+          role: user.role,
+          status: user.status
+        }
+      });
+      return;
     }
 
-    rel.status = status;
-    saveDb();
-    json(res, 200, { ok: true, relationId: rel.id, status: rel.status });
-  },
+    // POST /api/auth/logout or POST /api/logout
+    if (req.method === 'POST' && (pathname === '/api/auth/logout' || pathname === '/api/logout' || pathname === '/api/logout/all')) {
+      const clearCookie = `gym_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT;${SECURE}`;
+      sendJson(res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
+      return;
+    }
 
-  /* ---------- trainer package & membership management ---------- */
-  'GET /api/trainer/packages': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const clientId = new URL(req.url, 'http://x').searchParams.get('clientId');
-    if (!clientId) return json(res, 400, { error: 'clientId query parameter is required' });
+    /* ==========================================================================
+       2. CLIENT SYNC & STATE ENDPOINTS
+       ========================================================================== */
 
-    // Validate relationship
-    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
-    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+    // GET /api/data
+    if (req.method === 'GET' && pathname === '/api/data') {
+      const user = await authenticate(req);
+      if (!user) {
+        sendError(res, 401, 'No autenticado');
+        return;
+      }
 
-    let dirty = false;
-    const pkgs = (db.packages || []).filter(p => p.clientId === clientId);
-    pkgs.forEach(p => {
-      const prev = p.status;
-      syncPackageStatus(p);
-      if (p.status !== prev) dirty = true;
-    });
-    if (dirty) saveDb();
+      const st = await prisma.userState.findUnique({ where: { userId: user.id } });
+      let state = {};
+      if (st && st.data) {
+        try { state = JSON.parse(st.data); } catch {}
+      }
+      sendJson(res, 200, { state });
+      return;
+    }
 
-    const activePackage = pkgs.find(p => p.status === 'active') || null;
-    json(res, 200, { packages: pkgs.slice().reverse(), activePackage });
-  },
+    // PUT /api/data
+    if (req.method === 'PUT' && pathname === '/api/data') {
+      const user = await authenticate(req);
+      if (!user) {
+        sendError(res, 401, 'No autenticado');
+        return;
+      }
 
-  'POST /api/trainer/packages/create': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const body = await readBody(req);
-    const clientId = String(body.clientId || '').trim();
-    const name = String(body.name || '').trim().slice(0, 60);
-    const totalClasses = Math.round(+body.totalClasses || 0);
-    const expiresAt = body.expiresAt ? new Date(body.expiresAt).toISOString() : null;
-    const forceReplace = !!body.forceReplace;
+      const body = await readBody(req);
+      const stateObj = body.state || {};
+      const stateStr = JSON.stringify(stateObj);
 
-    if (!clientId) return json(res, 400, { error: 'clientId is required' });
-    if (!name) return json(res, 400, { error: 'name is required' });
-    if (totalClasses <= 0 || totalClasses > 1000) return json(res, 400, { error: 'totalClasses must be between 1 and 1000' });
-    if (!expiresAt || isNaN(new Date(expiresAt).getTime())) return json(res, 400, { error: 'valid expiresAt date is required' });
-    if (new Date(expiresAt).getTime() <= Date.now()) return json(res, 400, { error: 'expiresAt must be in the future' });
+      await prisma.userState.upsert({
+        where: { userId: user.id },
+        update: { data: stateStr },
+        create: { userId: user.id, data: stateStr }
+      });
 
-    // Validate relationship
-    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
-    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
 
-    db.packages = db.packages || [];
-    let dirty = false;
-    // Check existing active packages
-    const clientPkgs = db.packages.filter(p => p.clientId === clientId);
-    clientPkgs.forEach(p => {
-      const prev = p.status;
-      syncPackageStatus(p);
-      if (p.status !== prev) dirty = true;
-    });
+    // GET /api/client/membership
+    if (req.method === 'GET' && pathname === '/api/client/membership') {
+      const user = await authenticate(req);
+      if (!user || user.role !== 'client') {
+        sendError(res, 403, 'Acceso denegado');
+        return;
+      }
 
-    const currentActive = clientPkgs.find(p => p.status === 'active');
-    if (currentActive) {
-      if (!forceReplace) {
-        if (dirty) saveDb();
-        return json(res, 409, {
-          error: 'client already has an active package',
-          activePackage: currentActive
+      const packages = await prisma.package.findMany({
+        where: { clientId: user.id },
+        orderBy: { createdAt: 'desc' }
+      });
+
+      const activePackage = packages.find(p => p.status === 'active' && p.remainingClasses > 0) || packages[0] || null;
+      const recentAttendances = await prisma.attendance.findMany({
+        where: { clientId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 10
+      });
+
+      sendJson(res, 200, {
+        activePackage,
+        packages,
+        recentAttendances
+      });
+      return;
+    }
+
+    /* ==========================================================================
+       3. TRAINER MODULE ENDPOINTS (RBAC: Trainer Only)
+       ========================================================================== */
+
+    if (pathname.startsWith('/api/trainer/')) {
+      const user = await authenticate(req);
+      if (!user || user.role !== 'trainer') {
+        sendError(res, 403, 'Acceso denegado: solo entrenadores autorizados');
+        return;
+      }
+      const trainerId = user.id;
+
+      // GET /api/trainer/clients
+      if (req.method === 'GET' && pathname === '/api/trainer/clients') {
+        const relations = await prisma.trainerClient.findMany({
+          where: { trainerId },
+          include: {
+            client: {
+              include: {
+                packages: {
+                  where: { status: 'active' },
+                  orderBy: { createdAt: 'desc' },
+                  take: 1
+                },
+                attendances: {
+                  orderBy: { createdAt: 'desc' },
+                  take: 1
+                },
+                activationCodes: {
+                  where: { usedAt: null },
+                  orderBy: { createdAt: 'desc' },
+                  take: 1
+                }
+              }
+            }
+          },
+          orderBy: { assignedAt: 'desc' }
         });
-      }
-      currentActive.status = 'cancelled';
-      dirty = true;
-    }
 
-    const pkg = {
-      id: crypto.randomBytes(12).toString('base64url'),
-      clientId,
-      trainerId: trainer.id,
-      name,
-      totalClasses,
-      remainingClasses: totalClasses,
-      expiresAt,
-      createdAt: new Date().toISOString(),
-      status: 'active'
-    };
+        const clients = relations.map(r => {
+          const c = r.client;
+          const activePkg = c.packages[0] || null;
+          const lastAtt = c.attendances[0] || null;
+          const activeCode = c.activationCodes[0] || null;
 
-    db.packages.push(pkg);
-    saveDb();
-    json(res, 200, { ok: true, package: pkg });
-  },
-
-  'POST /api/trainer/packages/cancel': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const body = await readBody(req);
-    const packageId = String(body.packageId || '').trim();
-    if (!packageId) return json(res, 400, { error: 'packageId is required' });
-
-    db.packages = db.packages || [];
-    const pkg = db.packages.find(p => p.id === packageId);
-    if (!pkg) return json(res, 404, { error: 'package not found' });
-
-    // Check ownership
-    if (pkg.trainerId !== trainer.id && !isAdmin(trainer)) {
-      return json(res, 403, { error: 'forbidden: not your client package' });
-    }
-
-    syncPackageStatus(pkg);
-    if (pkg.status !== 'active') {
-      return json(res, 400, { error: `cannot cancel package with status: ${pkg.status}` });
-    }
-
-    pkg.status = 'cancelled';
-    if (body.reason) pkg.cancelReason = String(body.reason).trim().slice(0, 100);
-    saveDb();
-    json(res, 200, { ok: true, packageId: pkg.id, status: pkg.status });
-  },
-
-  /* ---------- trainer attendance management ---------- */
-  'GET /api/trainer/attendance': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const clientId = new URL(req.url, 'http://x').searchParams.get('clientId');
-    if (!clientId) return json(res, 400, { error: 'clientId query parameter is required' });
-
-    // Validate relationship
-    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
-    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
-
-    const list = (db.attendances || []).filter(a => a.clientId === clientId);
-    json(res, 200, { attendances: list.slice().reverse(), totalCount: list.length });
-  },
-
-  'POST /api/trainer/attendance/checkin': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const body = await readBody(req);
-    const clientId = String(body.clientId || '').trim();
-    if (!clientId) return json(res, 400, { error: 'clientId is required' });
-
-    const client = db.users.find(u => u.id === clientId);
-    if (!client) return json(res, 404, { error: 'client not found' });
-
-    // Validate relationship
-    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
-    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
-
-    const workoutId = body.workoutId ? String(body.workoutId).trim() : null;
-    const note = body.note ? String(body.note).trim().slice(0, 200) : null;
-    const attDate = body.date && /^\d{4}-\d{2}-\d{2}$/.test(body.date) ? body.date : new Date().toISOString().slice(0, 10);
-
-    db.attendances = db.attendances || [];
-    db.packages = db.packages || [];
-
-    // Idempotency check 1: workoutId
-    if (workoutId) {
-      const existing = db.attendances.find(a => a.clientId === clientId && a.workoutId === workoutId);
-      if (existing) {
-        const pkg = db.packages.find(p => p.id === existing.packageId) || null;
-        return json(res, 200, {
-          ok: true,
-          attendance: existing,
-          remainingClasses: pkg ? pkg.remainingClasses : null,
-          packageStatus: pkg ? pkg.status : null,
-          alreadyProcessed: true
+          return {
+            id: r.id,
+            clientId: c.id,
+            name: c.name,
+            username: c.username,
+            email: c.email,
+            phone: c.phone,
+            status: c.status,
+            assignedAt: r.assignedAt,
+            hasPassword: !!c.passwordHash,
+            activationCode: activeCode ? activeCode.code : null,
+            activePackage: activePkg ? {
+              id: activePkg.id,
+              name: activePkg.name,
+              totalClasses: activePkg.totalClasses,
+              remainingClasses: activePkg.remainingClasses,
+              expiresAt: activePkg.expiresAt,
+              status: activePkg.status
+            } : null,
+            lastAttendance: lastAtt ? lastAtt.date : null
+          };
         });
-      }
-    }
 
-    // Idempotency check 2: manual check-in within last 60 seconds for same client, trainer and date
-    if (!workoutId) {
-      const recent = db.attendances.find(a =>
-        a.clientId === clientId &&
-        a.trainerId === trainer.id &&
-        a.date === attDate &&
-        !a.workoutId &&
-        (Date.now() - new Date(a.createdAt).getTime()) < 60000
-      );
-      if (recent) {
-        const pkg = db.packages.find(p => p.id === recent.packageId) || null;
-        return json(res, 200, {
-          ok: true,
-          attendance: recent,
-          remainingClasses: pkg ? pkg.remainingClasses : null,
-          packageStatus: pkg ? pkg.status : null,
-          alreadyProcessed: true
+        sendJson(res, 200, { clients });
+        return;
+      }
+
+      // POST /api/trainer/clients
+      if (req.method === 'POST' && pathname === '/api/trainer/clients') {
+        const body = await readBody(req);
+        const name = (body.name || '').trim();
+        const email = (body.email || '').trim().toLowerCase() || null;
+        const phone = (body.phone || '').trim() || null;
+        const notes = (body.notes || '').trim() || null;
+
+        if (!name) {
+          sendError(res, 400, 'El nombre del cliente es requerido');
+          return;
+        }
+
+        const clientId = crypto.randomBytes(12).toString('base64url');
+        const usernameBase = name.toLowerCase().replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '') || 'cliente';
+        let username = `${usernameBase}_${crypto.randomBytes(2).toString('hex')}`;
+
+        // Crear cliente
+        const newClient = await prisma.user.create({
+          data: {
+            id: clientId,
+            username,
+            name,
+            email,
+            phone,
+            notes,
+            role: 'client',
+            status: 'pending_activation'
+          }
         });
+
+        // Relación Trainer-Client
+        const relationId = crypto.randomBytes(12).toString('base64url');
+        await prisma.trainerClient.create({
+          data: {
+            id: relationId,
+            trainerId,
+            clientId,
+            status: 'active'
+          }
+        });
+
+        // Código de activación
+        const code = crypto.randomBytes(3).toString('hex').toUpperCase();
+        await prisma.activationCode.create({
+          data: {
+            code,
+            clientId,
+            trainerId
+          }
+        });
+
+        // Paquete inicial opcional si se envió totalClasses
+        let pkg = null;
+        if (body.totalClasses && +body.totalClasses > 0) {
+          const pkgId = crypto.randomBytes(12).toString('base64url');
+          pkg = await prisma.package.create({
+            data: {
+              id: pkgId,
+              clientId,
+              trainerId,
+              name: body.packageName || `Paquete ${body.totalClasses} Clases`,
+              totalClasses: +body.totalClasses,
+              remainingClasses: +body.totalClasses,
+              price: body.price ? +body.price : null,
+              expiresAt: body.expiresAt ? new Date(body.expiresAt) : null
+            }
+          });
+        }
+
+        // Estado inicial de rutinas
+        const starterState = {
+          routines: [{ id: 'r1', name: 'Rutina Inicial', emoji: 'dumbbell', ex: [] }],
+          week: { '1': 'r1', '3': 'r1', '5': 'r1' },
+          dayPlan: {},
+          workouts: [],
+          bodyweight: [],
+          _ts: Date.now()
+        };
+        await prisma.userState.create({
+          data: {
+            userId: clientId,
+            data: JSON.stringify(starterState)
+          }
+        });
+
+        sendJson(res, 201, {
+          client: {
+            id: relationId,
+            clientId,
+            name,
+            username,
+            email,
+            status: 'pending_activation',
+            activationCode: code,
+            activePackage: pkg
+          }
+        });
+        return;
+      }
+
+      // GET /api/trainer/clients/:id
+      const clientDetailMatch = pathname.match(/^\/api\/trainer\/clients\/([a-zA-Z0-9_-]+)$/);
+      if (req.method === 'GET' && clientDetailMatch) {
+        const targetClientId = clientDetailMatch[1];
+        
+        // Validar que el cliente pertenezca al entrenador
+        const relation = await prisma.trainerClient.findFirst({
+          where: { trainerId, clientId: targetClientId },
+          include: { client: true }
+        });
+
+        if (!relation || !relation.client) {
+          sendError(res, 404, 'Cliente no encontrado o no asignado');
+          return;
+        }
+
+        const client = relation.client;
+        const packages = await prisma.package.findMany({
+          where: { clientId: targetClientId },
+          orderBy: { createdAt: 'desc' }
+        });
+        const attendances = await prisma.attendance.findMany({
+          where: { clientId: targetClientId },
+          orderBy: { createdAt: 'desc' },
+          take: 50
+        });
+        const activationCode = await prisma.activationCode.findFirst({
+          where: { clientId: targetClientId, usedAt: null },
+          orderBy: { createdAt: 'desc' }
+        });
+        const userState = await prisma.userState.findUnique({
+          where: { userId: targetClientId }
+        });
+
+        let parsedState = {};
+        if (userState && userState.data) {
+          try { parsedState = JSON.parse(userState.data); } catch {}
+        }
+
+        sendJson(res, 200, {
+          client: {
+            id: client.id,
+            name: client.name,
+            username: client.username,
+            email: client.email,
+            phone: client.phone,
+            notes: client.notes,
+            status: client.status,
+            activationCode: activationCode ? activationCode.code : null,
+            assignedAt: relation.assignedAt
+          },
+          packages,
+          attendances,
+          state: parsedState
+        });
+        return;
+      }
+
+      // PUT /api/trainer/clients/:id
+      if (req.method === 'PUT' && clientDetailMatch) {
+        const targetClientId = clientDetailMatch[1];
+        const body = await readBody(req);
+
+        const relation = await prisma.trainerClient.findFirst({
+          where: { trainerId, clientId: targetClientId }
+        });
+        if (!relation) {
+          sendError(res, 404, 'Cliente no encontrado');
+          return;
+        }
+
+        const updated = await prisma.user.update({
+          where: { id: targetClientId },
+          data: {
+            name: body.name !== undefined ? body.name : undefined,
+            email: body.email !== undefined ? body.email : undefined,
+            phone: body.phone !== undefined ? body.phone : undefined,
+            notes: body.notes !== undefined ? body.notes : undefined,
+            status: body.status !== undefined ? body.status : undefined
+          }
+        });
+
+        sendJson(res, 200, { client: updated });
+        return;
+      }
+
+      // POST /api/trainer/clients/:id/code or /api/trainer/clients/code
+      if (req.method === 'POST' && (pathname === '/api/trainer/clients/code' || pathname.endsWith('/code'))) {
+        const body = await readBody(req);
+        let targetClientId = body.clientId;
+        if (!targetClientId && clientDetailMatch) targetClientId = clientDetailMatch[1];
+
+        if (!targetClientId) {
+          sendError(res, 400, 'clientId es requerido');
+          return;
+        }
+
+        const code = crypto.randomBytes(3).toString('hex').toUpperCase();
+        await prisma.activationCode.create({
+          data: {
+            code,
+            clientId: targetClientId,
+            trainerId
+          }
+        });
+
+        sendJson(res, 200, { code });
+        return;
+      }
+
+      // GET /api/trainer/packages
+      if (req.method === 'GET' && pathname === '/api/trainer/packages') {
+        const targetClientId = url.searchParams.get('clientId');
+        const where = { trainerId };
+        if (targetClientId) where.clientId = targetClientId;
+
+        const packages = await prisma.package.findMany({
+          where,
+          orderBy: { createdAt: 'desc' }
+        });
+
+        const activePackage = packages.find(p => p.status === 'active' && p.remainingClasses > 0) || null;
+        sendJson(res, 200, { packages, activePackage });
+        return;
+      }
+
+      // POST /api/trainer/packages
+      if (req.method === 'POST' && pathname === '/api/trainer/packages') {
+        const body = await readBody(req);
+        const targetClientId = body.clientId;
+        const totalClasses = +(body.totalClasses || 10);
+        const name = body.name || `Paquete ${totalClasses} Clases`;
+        const price = body.price ? +body.price : null;
+        const expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
+
+        if (!targetClientId) {
+          sendError(res, 400, 'clientId es requerido');
+          return;
+        }
+
+        const pkgId = crypto.randomBytes(12).toString('base64url');
+        const pkg = await prisma.package.create({
+          data: {
+            id: pkgId,
+            clientId: targetClientId,
+            trainerId,
+            name,
+            totalClasses,
+            remainingClasses: totalClasses,
+            price,
+            expiresAt,
+            status: 'active'
+          }
+        });
+
+        sendJson(res, 201, { package: pkg });
+        return;
+      }
+
+      // POST /api/trainer/attendance/checkin
+      if (req.method === 'POST' && pathname === '/api/trainer/attendance/checkin') {
+        const body = await readBody(req);
+        const targetClientId = body.clientId;
+        const today = body.date || new Date().toISOString().slice(0, 10);
+
+        if (!targetClientId) {
+          sendError(res, 400, 'clientId es requerido');
+          return;
+        }
+
+        // Buscar paquete activo con clases restantes
+        const activePkg = await prisma.package.findFirst({
+          where: {
+            clientId: targetClientId,
+            status: 'active',
+            remainingClasses: { gt: 0 }
+          },
+          orderBy: { createdAt: 'desc' }
+        });
+
+        if (!activePkg) {
+          sendError(res, 400, 'El cliente no cuenta con un paquete activo con clases disponibles');
+          return;
+        }
+
+        // Verificar si ya se registró asistencia hoy para advertir o procesar
+        const existingToday = await prisma.attendance.findFirst({
+          where: {
+            clientId: targetClientId,
+            date: today
+          }
+        });
+
+        if (existingToday && !body.force) {
+          sendJson(res, 200, {
+            alreadyProcessed: true,
+            message: 'Ya se registró asistencia hoy para este cliente',
+            remainingClasses: activePkg.remainingClasses
+          });
+          return;
+        }
+
+        // Descontar clase y registrar asistencia en una transacción
+        const newRemaining = Math.max(0, activePkg.remainingClasses - 1);
+        const newStatus = newRemaining === 0 ? 'completed' : 'active';
+
+        const [attendance] = await prisma.$transaction([
+          prisma.attendance.create({
+            data: {
+              id: crypto.randomBytes(12).toString('base64url'),
+              packageId: activePkg.id,
+              clientId: targetClientId,
+              trainerId,
+              date: today,
+              note: body.note || null
+            }
+          }),
+          prisma.package.update({
+            where: { id: activePkg.id },
+            data: {
+              remainingClasses: newRemaining,
+              status: newStatus
+            }
+          })
+        ]);
+
+        sendJson(res, 200, {
+          success: true,
+          attendance,
+          remainingClasses: newRemaining,
+          packageStatus: newStatus
+        });
+        return;
+      }
+
+      // POST /api/trainer/client/plan
+      if (req.method === 'POST' && pathname === '/api/trainer/client/plan') {
+        const body = await readBody(req);
+        const targetClientId = body.clientId;
+        const week = body.week || {};
+        const routines = body.routines || [];
+
+        if (!targetClientId) {
+          sendError(res, 400, 'clientId es requerido');
+          return;
+        }
+
+        // Obtener estado actual del cliente
+        const stRecord = await prisma.userState.findUnique({ where: { userId: targetClientId } });
+        let st = { routines: [], week: {}, dayPlan: {}, workouts: [], bodyweight: [] };
+        if (stRecord && stRecord.data) {
+          try { st = JSON.parse(stRecord.data); } catch {}
+        }
+
+        if (routines.length > 0) st.routines = routines;
+        if (week) st.week = week;
+        st._ts = Date.now();
+
+        await prisma.userState.upsert({
+          where: { userId: targetClientId },
+          update: { data: JSON.stringify(st) },
+          create: { userId: targetClientId, data: JSON.stringify(st) }
+        });
+
+        sendJson(res, 200, { success: true, state: st });
+        return;
       }
     }
 
-    // Find and sync active package for this client
-    let dirty = false;
-    const clientPkgs = db.packages.filter(p => p.clientId === clientId);
-    clientPkgs.forEach(p => {
-      const prev = p.status;
-      syncPackageStatus(p);
-      if (p.status !== prev) dirty = true;
-    });
-
-    const activePkg = clientPkgs.find(p => p.status === 'active' && p.remainingClasses > 0);
-    if (!activePkg) {
-      if (dirty) saveDb();
-      return json(res, 400, { error: 'no active package with available classes' });
-    }
-
-    // Atomic mutation: deduct 1 class and record attendance
-    activePkg.remainingClasses -= 1;
-    if (activePkg.remainingClasses === 0) {
-      activePkg.status = 'completed';
-    }
-
-    const attendance = {
-      id: crypto.randomBytes(12).toString('base64url'),
-      packageId: activePkg.id,
-      clientId,
-      trainerId: trainer.id,
-      date: attDate,
-      workoutId,
-      note,
-      createdAt: new Date().toISOString()
-    };
-
-    db.attendances.push(attendance);
-    saveDb();
-
-    json(res, 200, {
-      ok: true,
-      attendance,
-      remainingClasses: activePkg.remainingClasses,
-      packageStatus: activePkg.status,
-      alreadyProcessed: false
-    });
-  },
-
-  /* ---------- trainer routine & plan management ---------- */
-  'GET /api/trainer/client/plan': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const clientId = new URL(req.url, 'http://x').searchParams.get('clientId');
-    if (!clientId) return json(res, 400, { error: 'clientId query parameter is required' });
-
-    // Validate relationship
-    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
-    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
-
-    const client = db.users.find(u => u.id === clientId);
-    if (!client) return json(res, 404, { error: 'client not found' });
-
-    const S = readState(clientId) || {};
-    json(res, 200, {
-      clientId,
-      routines: S.routines || [],
-      week: S.week || {},
-      dayPlan: S.dayPlan || {},
-      lastSync: S._ts || null
-    });
-  },
-
-  'PUT /api/trainer/client/plan': async (req, res) => {
-    const trainer = requireTrainer(req, res);
-    if (!trainer) return;
-    const body = await readBody(req);
-    const clientId = String(body.clientId || '').trim();
-    if (!clientId) return json(res, 400, { error: 'clientId is required' });
-
-    const client = db.users.find(u => u.id === clientId);
-    if (!client) return json(res, 404, { error: 'client not found' });
-
-    // Validate relationship
-    const rel = (db.trainer_clients || []).find(r => r.trainerId === trainer.id && r.clientId === clientId && r.status !== 'archived');
-    if (!rel && !isAdmin(trainer)) return json(res, 403, { error: 'forbidden: client not assigned to this trainer' });
-
-    if (body.routines !== undefined && !Array.isArray(body.routines)) {
-      return json(res, 400, { error: 'routines must be an array' });
-    }
-
-    // Read current state or create empty container
-    const S = readState(clientId) || {};
-
-    // Strictly modify ONLY plan fields
-    if (body.routines !== undefined) S.routines = body.routines;
-    if (body.week !== undefined && typeof body.week === 'object' && body.week !== null) S.week = body.week;
-    if (body.dayPlan !== undefined && typeof body.dayPlan === 'object' && body.dayPlan !== null) S.dayPlan = body.dayPlan;
-
-    // Stamp new timestamp so client's pullState picks up changes
-    S._ts = Date.now();
-
-    // Workouts, bodyweight, active and user preferences remain completely untouched
-    atomicWrite(stateFile(clientId), JSON.stringify(S));
-
-    json(res, 200, {
-      ok: true,
-      clientId,
-      updatedAt: S._ts
-    });
+    // 404
+    sendError(res, 404, 'Endpoint no encontrado');
+  } catch (err) {
+    console.error('API Error:', err);
+    sendError(res, 500, err.message || 'Error interno del servidor');
   }
-};
+});
 
-http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x');
-  const key = req.method + ' ' + url.pathname;
-  const handler = routes[key];
-  if (!handler) return json(res, 404, { error: 'not found' });
-  try { await handler(req, res); }
-  catch (e) {
-    console.error(key, e);
-    if (!res.headersSent) json(res, 500, { error: 'server error' });
-  }
-}).listen(PORT, () => console.log(`gym-api on :${PORT} (rpID=${RP_ID}, origin=${ORIGIN})`));
+server.listen(PORT, () => {
+  console.log(`✓ Gym Platform API escuchando en puerto ${PORT}`);
+});

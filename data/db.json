@@ -3,7 +3,14 @@
     {
       "id": "piYdx5GveQarq8u9",
       "name": "Arvids",
+      "role": "trainer",
       "created": "2026-08-03T18:06:47.577Z"
+    },
+    {
+      "id": "4TeQTO1E7QFxdd0N",
+      "name": "Carlos Cliente",
+      "role": "client",
+      "created": "2026-09-19T19:14:35.331Z"
     }
   ],
   "creds": [
@@ -19,5 +26,47 @@
     }
   ],
   "subs": [],
-  "invites": []
+  "invites": [],
+  "trainer_clients": [
+    {
+      "id": "fFF38RFMwhAw8qyU",
+      "trainerId": "piYdx5GveQarq8u9",
+      "clientId": "4TeQTO1E7QFxdd0N",
+      "assignedAt": "2026-09-19T19:14:35.331Z",
+      "status": "active"
+    }
+  ],
+  "packages": [
+    {
+      "id": "X8p2zG4QVIZjzt53",
+      "clientId": "4TeQTO1E7QFxdd0N",
+      "trainerId": "piYdx5GveQarq8u9",
+      "name": "Paquete 10 Clases",
+      "totalClasses": 10,
+      "remainingClasses": 9,
+      "expiresAt": "2026-10-19T19:14:35.358Z",
+      "createdAt": "2026-09-19T19:14:35.369Z",
+      "status": "active"
+    }
+  ],
+  "attendances": [
+    {
+      "id": "ujNhPseu0-RnnUJj",
+      "packageId": "X8p2zG4QVIZjzt53",
+      "clientId": "4TeQTO1E7QFxdd0N",
+      "trainerId": "piYdx5GveQarq8u9",
+      "date": "2026-09-19",
+      "workoutId": null,
+      "note": null,
+      "createdAt": "2026-09-19T19:14:35.399Z"
+    }
+  ],
+  "activation_codes": [
+    {
+      "code": "B07419",
+      "clientId": "4TeQTO1E7QFxdd0N",
+      "trainerId": "piYdx5GveQarq8u9",
+      "createdAt": "2026-09-19T20:18:38.462Z"
+    }
+  ]
 }

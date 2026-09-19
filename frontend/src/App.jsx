@@ -68,7 +68,7 @@ function Shell() {
         <ErrorBoundary>
           {!authed ? <Login /> : (
             <Routes>
-              <Route path="/home" element={<Home />} />
+              <Route path="/home" element={user?.role === 'trainer' ? <Navigate to="/trainer" replace /> : <Home />} />
               <Route path="/plan" element={<Plan />} />
               <Route path="/plan/r/:id" element={<RoutineEdit />} />
               <Route path="/workout" element={<Workout />} />
@@ -78,7 +78,7 @@ function Shell() {
               <Route path="/settings" element={<Settings />} />
               <Route path="/trainer" element={user?.role === 'trainer' ? <TrainerDashboard /> : <Navigate to="/home" replace />} />
               <Route path="/admin" element={user?.admin ? <Admin /> : <Navigate to="/home" replace />} />
-              <Route path="*" element={<Navigate to="/home" replace />} />
+              <Route path="*" element={<Navigate to={user?.role === 'trainer' ? '/trainer' : '/home'} replace />} />
             </Routes>
           )}
         </ErrorBoundary>

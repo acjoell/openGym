@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
 import { effectiveRoutine, effectiveRoutineId, streakWeeks, lastBW, setsDoneActive } from '../lib/history.js'
 import { fmtNum, fmtDate, todayISO, isoOf, weekKey, DAYS } from '../lib/format.js'
 import { t, dateLocale } from '../lib/i18n.js'
+import { api } from '../lib/api.js'
 import { bwSheet, goalSheet, dayOverrideSheet, calendarSheet, startFlow, loadStarterPlan, bwDeltaColor } from '../sheets.jsx'
 import LineChart from '../components/LineChart.jsx'
 import Icon from '../components/Icon.jsx'
@@ -16,6 +17,13 @@ export default function Home() {
   const S = useStore(s => s.S)
   const user = useStore(s => s.user)
   const [weekOffset, setWeekOffset] = useState(0)
+  const [membership, setMembership] = useState(null)
+
+  useEffect(() => {
+    if (user && user.role === 'client') {
+      api('/api/client/membership').then(setMembership).catch(() => {})
+    }
+  }, [user])
 
   const today = new Date()
   const routine = effectiveRoutine(S, todayISO())
@@ -42,14 +50,52 @@ export default function Home() {
   const plannedPerWeek = Object.keys(S.week).filter(k => S.week[k]).length
   const bwPoints = S.bodyweight.slice(-30).map(b => ({ t: b.t || new Date(b.d).getTime(), y: b.w, d: b.d }))
 
+  const signOut = useStore(s => s.signOut)
+  const handleSignOut = () => {
+    confirmSheet({
+      title: t('¿Cerrar sesión?'),
+      message: t('¿Deseas salir de tu cuenta?'),
+      confirmText: t('Cerrar sesión'),
+      danger: true,
+      onConfirm: async () => {
+        await signOut()
+        nav('/home')
+      }
+    })
+  }
+
   // today's session shown right under the week strip
   const onToday = () => { if (S.active) nav('/workout'); else if (routine) startFlow(routine.id); else dayOverrideSheet(todayISO()) }
 
   return <div className="narrow">
     <div className="hdr">
       <div><h1>{user ? t('Hi {0}', user.name) : 'openGym'}</h1><div className="sub">{today.toLocaleDateString(dateLocale(), { weekday: 'long', day: 'numeric', month: 'long' })}</div></div>
-      <button className="iconbtn" onClick={() => nav('/settings')} aria-label={t('Settings')}><Icon name="gear" /></button>
+      <div className="row" style={{ gap: 6 }}>
+        <button className="iconbtn" onClick={() => nav('/settings')} aria-label={t('Settings')}><Icon name="gear" /></button>
+        <button className="iconbtn" style={{ color: 'var(--red)' }} onClick={handleSignOut} aria-label={t('Cerrar sesión')} title={t('Cerrar sesión')}><Icon name="signOut" /></button>
+      </div>
     </div>
+
+    {/* Membership Card */}
+    {membership?.activePackage && (
+      <div className="card" style={{ background: 'var(--bg-card-sub, rgba(255,255,255,0.04))', marginBottom: 12 }}>
+        <div className="row between">
+          <div>
+            <div className="small muted" style={{ fontWeight: 600 }}>{t('Membresía Activa')}</div>
+            <div style={{ fontWeight: 700, fontSize: '1.05rem', marginTop: 2 }}>{membership.activePackage.name}</div>
+            <div className="dim small" style={{ marginTop: 2 }}>
+              {t('Vence: {0}', fmtDate(membership.activePackage.expiresAt ? membership.activePackage.expiresAt.slice(0, 10) : '—'))}
+            </div>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <span style={{ fontWeight: 700, fontSize: '1.25rem', color: membership.activePackage.remainingClasses > 3 ? 'var(--acc)' : 'var(--red)' }}>
+              {membership.activePackage.remainingClasses} / {membership.activePackage.totalClasses}
+            </span>
+            <div className="dim small">{t('clases restantes')}</div>
+          </div>
+        </div>
+      </div>
+    )}
 
     <div className="card">
       <div className="row between" style={{ marginBottom: 8 }}>

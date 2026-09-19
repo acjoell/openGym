@@ -30,7 +30,7 @@ export default function TabBar({ onStart }) {
 
   return (
     <nav id="tabbar">
-      <Tab k="home" icon="house" to="/home" label={t('Home')} />
+      <Tab k={user?.role === 'trainer' ? 'trainer' : 'home'} icon="house" to={user?.role === 'trainer' ? '/trainer' : '/home'} label={user?.role === 'trainer' ? t('Trainer') : t('Home')} />
       <Tab k="plan" icon="calendar" to="/plan" label={t('Plan')} />
       <button className={'start' + (S.active ? ' rec' : '')} onClick={startWorkout}>
         <span className="cir"><Icon name={S.active ? 'play' : 'dumbbell'} /></span>
