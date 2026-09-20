@@ -29,10 +29,12 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      - PORT=3000            # internal port (nginx proxies here) — do not change
+      - PORT=3000
       - DATA_DIR=/data
+    ports:
+      - "5555:5555"
     volumes:
-      - ./data:/data         # users, passkeys, per-user state, session secret — BACK THIS UP
+      - ./data:/data
 
   # Builds the React frontend (multi-stage) and serves it, proxying /api → api
   # and the exercise media from the shared volume. Single origin for passkeys.
